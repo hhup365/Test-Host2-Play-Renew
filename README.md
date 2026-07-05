@@ -9,6 +9,10 @@ TG_TC=your_telegram_bot_token your_chat_id
 # Proxy URL (http/socks5/hy2/tuic/vless/vmess/ss)
 PROXY_URL_1=http://127.0.0.1:8080
 PROXY_URL_2=http://127.0.0.1:8081
+
+# Proxy LINK
+PROXY_LINK_1=https://examlpe.com/xxx
+PROXY_LINK_2=(http://examlpe.com/xxx
 ```
 
 ## Source
