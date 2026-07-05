@@ -8,6 +8,7 @@ import requests
 import tempfile
 import subprocess
 import signal
+import base64
 from datetime import datetime, timezone, timedelta
 from xvfbwrapper import Xvfb
 from DrissionPage import ChromiumPage, ChromiumOptions
@@ -19,7 +20,6 @@ except ImportError:
     pass
 
 MAX_CAPTCHA = 3
-MAX_RENEW_RETRIES_PER_URL = 50
 LOCAL_PROXY = "http://127.0.0.1:8080"
 
 class CaptchaBlocked(Exception):
@@ -80,6 +80,25 @@ def build_notification(success, account_id, url, server_name, old_expire, new_ex
 ━━━━━━━━━━━━━━━━━━
 <i>Host2Play Auto Renew Bot</i>"""
     return caption
+
+def fetch_subscription(url):
+    try:
+        r = requests.get(url, timeout=15)
+        r.raise_for_status()
+        text = r.text.strip()
+        
+        if "://" in text:
+            return [line.strip() for line in text.splitlines() if "://" in line]
+        
+        text = text.replace("-", "+").replace("_", "/")
+        pad = 4 - len(text) % 4
+        if pad != 4: 
+            text += "=" * pad
+        decoded = base64.b64decode(text).decode("utf-8")
+        return [line.strip() for line in decoded.splitlines() if "://" in line]
+    except Exception as e:
+        log(f"获取或解析订阅链接失败: {e}", "ERROR")
+        return []
 
 def get_server_name(page):
     try:
@@ -295,123 +314,159 @@ def solve_recaptcha(page, use_proxy):
         time.sleep(2)
     raise RuntimeError("验证码达到最大尝试次数")
 
+def execute_browser_task(acc_id, url, using_custom_proxy, current_route):
+    screenshot_dir = "output/screenshots"
+    os.makedirs(screenshot_dir, exist_ok=True)
+    
+    success, server_name, old_expire, new_expire, failure_reason = False, "未知", "未知", "未知", ""
+    screenshot_path = None
+    page = None
+    
+    try:
+        co = ChromiumOptions()
+        co.set_browser_path('/usr/bin/google-chrome')
+        co.set_argument('--no-sandbox')
+        co.set_argument('--disable-gpu')
+        co.set_argument('--window-size=1280,720')
+        co.set_argument('--log-level=3')
+        
+        if using_custom_proxy: 
+            co.set_argument(f'--proxy-server={LOCAL_PROXY}')
+            
+        co.set_user_data_path(tempfile.mkdtemp())
+        co.auto_port()
+        co.headless(False)
+        page = ChromiumPage(co)
+
+        page.add_init_js("""
+            Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+            WebGLRenderingContext.prototype.getParameter = function(p) { return p === 37446 ? 'Intel(R) UHD Graphics 630' : 1; };
+        """)
+
+        page.get(url, retry=3)
+        time.sleep(random.uniform(5, 8))
+
+        server_name = get_server_name(page)
+        old_expire = get_expire_time(page)
+        log(f"节点: {server_name}, 当前到期: {old_expire}, 当前路由: {current_route}")
+
+        page.run_js("document.querySelectorAll('ins.adsbygoogle, .modal-backdrop').forEach(e => e.remove());")
+        if consent := page.ele('tag:button@@text():Consent', timeout=2): consent.click()
+        time.sleep(2)
+
+        if renew_btn1 := page.ele('xpath://button[contains(text(), "Renew server")]', timeout=3): renew_btn1.click(by_js=True)
+        time.sleep(3)
+
+        page.ele('text:Expires in:', timeout=8)
+        if renew_btn2 := page.ele('xpath://button[contains(text(), "Renew server")]', timeout=2): renew_btn2.click(by_js=True)
+        time.sleep(8)
+
+        if find_recaptcha_frame(page, "anchor"):
+            log("启动 reCAPTCHA 破解...")
+            solve_recaptcha(page, using_custom_proxy) # 如被封禁将抛出 CaptchaBlocked
+        
+        if final_btn := page.ele('xpath://button[normalize-space(text())="Renew"]', timeout=3):
+            final_btn.click(by_js=True)
+            time.sleep(10)
+            new_expire = get_expire_time(page)
+            if new_expire != old_expire and new_expire != "未知": 
+                success = True
+            elif "successfully" in (page.html or "").lower(): 
+                success = True
+            else: 
+                failure_reason = "未能检测到成功标志"
+        else:
+            failure_reason = "未找到最终 Renew 按钮"
+
+    except CaptchaBlocked:
+        log("IP 被封锁！", "WARN")
+        failure_reason = "CaptchaBlocked: IP被封锁"
+    except Exception as e:
+        log(f"尝试异常: {e}", "ERROR")
+        failure_reason = str(e)[:200]
+    finally:
+        if page:
+            screen_name = f"account-{acc_id}-{'success' if success else 'fail'}.png"
+            screenshot_path = capture_page_screenshot(page, os.path.join(screenshot_dir, screen_name))
+            try: page.quit()
+            except: pass
+            
+    return success, server_name, old_expire, new_expire, screenshot_path, failure_reason
+
 def process_account(account):
     acc_id = account['id']
     url = account['url']
     proxy_url = account['proxy']
+    proxy_link = account.get('proxy_link', '')
     
     success, server_name, old_expire, new_expire, failure_reason = False, "未知", "未知", "未知", ""
-    screenshot_dir = "output/screenshots"
-    os.makedirs(screenshot_dir, exist_ok=True)
     screenshot_path = None
-    final_route_type = "代理 (Sing-box)" if proxy_url else "全局 WARP"
+    final_route_type = "未执行"
 
     vdisplay = Xvfb(width=1280, height=720, colordepth=24)
     vdisplay.start()
     
-    singbox_proc = None
-    fallback_to_warp = False 
-    
     try:
-        for attempt in range(1, MAX_RENEW_RETRIES_PER_URL + 1):
-            log(f"--- 账号 {acc_id} | 续期尝试 {attempt}/{MAX_RENEW_RETRIES_PER_URL} ---")
-            page = None
-            using_custom_proxy = bool(proxy_url) and not fallback_to_warp
+        proxies_to_try = []
+        if proxy_url:
+            proxies_to_try.append(proxy_url)
+        if proxy_link:
+            log(f"账号 {acc_id} 配置了订阅链接，正在获取解析...")
+            subs = fetch_subscription(proxy_link)
+            if subs:
+                log(f"解析到 {len(subs)} 个有效代理节点。")
+                proxies_to_try.extend(subs)
+            else:
+                log("未解析出任何代理节点或订阅链接无效", "WARN")
+
+        # 2. 按顺序执行每个自定义代理节点
+        for p_idx, p in enumerate(proxies_to_try):
+            if success: break
             
-            if using_custom_proxy and not singbox_proc:
-                singbox_proc = start_singbox(proxy_url)
+            # 单代理尝试固定为 3 次
+            for attempt in range(1, 4):
+                current_route = f"代理节点 {p_idx+1} (Sing-box)"
+                log(f"--- 账号 {acc_id} | {current_route} | 续期尝试 {attempt}/3 ---")
+                
+                singbox_proc = start_singbox(p)
                 if not singbox_proc:
-                    log("自定义代理启动失败，直接回退 WARP")
-                    fallback_to_warp = True
-                    using_custom_proxy = False
-
-            current_route = "代理 (Sing-box)" if using_custom_proxy else "全局 WARP"
-            final_route_type = current_route
-
-            try:
-                co = ChromiumOptions()
-                co.set_browser_path('/usr/bin/google-chrome')
-                co.set_argument('--no-sandbox')
-                co.set_argument('--disable-gpu')
-                co.set_argument('--window-size=1280,720')
-                co.set_argument('--log-level=3')
-                
-                if using_custom_proxy: co.set_argument(f'--proxy-server={LOCAL_PROXY}')
+                    log("自定义代理启动失败，跳过此次重试")
+                    continue
                     
-                co.set_user_data_path(tempfile.mkdtemp())
-                co.auto_port()
-                co.headless(False)
-                page = ChromiumPage(co)
-
-                page.add_init_js("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    WebGLRenderingContext.prototype.getParameter = function(p) { return p === 37446 ? 'Intel(R) UHD Graphics 630' : 1; };
-                """)
-
-                page.get(url, retry=3)
-                time.sleep(random.uniform(5, 8))
-
-                server_name = get_server_name(page)
-                old_expire = get_expire_time(page)
-                log(f"节点: {server_name}, 当前到期: {old_expire}, 当前路由: {current_route}")
-
-                page.run_js("document.querySelectorAll('ins.adsbygoogle, .modal-backdrop').forEach(e => e.remove());")
-                if consent := page.ele('tag:button@@text():Consent', timeout=2): consent.click()
-                time.sleep(2)
-
-                if renew_btn1 := page.ele('xpath://button[contains(text(), "Renew server")]', timeout=3): renew_btn1.click(by_js=True)
-                time.sleep(3)
-
-                page.ele('text:Expires in:', timeout=8)
-                if renew_btn2 := page.ele('xpath://button[contains(text(), "Renew server")]', timeout=2): renew_btn2.click(by_js=True)
-                time.sleep(8)
-
-                if find_recaptcha_frame(page, "anchor"):
-                    log("启动 reCAPTCHA 破解...")
-                    try:
-                        solve_recaptcha(page, using_custom_proxy)
-                    except CaptchaBlocked:
-                        log("IP 被封锁！", "WARN")
-                        if using_custom_proxy:
-                            log("废弃当前代理，回退到 WARP")
-                            stop_singbox(singbox_proc)
-                            singbox_proc = None
-                            fallback_to_warp = True
-                        restart_warp()
-                        continue
+                s, s_name, o_exp, n_exp, screen, reason = execute_browser_task(acc_id, url, True, current_route)
+                stop_singbox(singbox_proc)
                 
-                if final_btn := page.ele('xpath://button[normalize-space(text())="Renew"]', timeout=3):
-                    final_btn.click(by_js=True)
-                    time.sleep(10)
-                    new_expire = get_expire_time(page)
-                    if new_expire != old_expire and new_expire != "未知": success = True
-                    elif "successfully" in (page.html or "").lower(): success = True
-                    else: failure_reason = "未能检测到成功标志"
-                else:
-                    failure_reason = "未找到最终 Renew 按钮"
+                success, server_name, old_expire, new_expire = s, s_name, o_exp, n_exp
+                screenshot_path, failure_reason, final_route_type = screen, reason, current_route
                 
-                if success: break
+                if success:
+                    break
+                    
+                if "IP被封锁" in failure_reason:
+                    log("当前代理IP已被验证码封锁，终止当前代理其余尝试，更换下一个节点", "WARN")
+                    break  # IP已被封禁，尝试下个节点
 
-            except Exception as e:
-                log(f"尝试异常: {e}", "ERROR")
-                failure_reason = str(e)[:200]
-                if using_custom_proxy:
-                    stop_singbox(singbox_proc)
-                    singbox_proc = None
-                    fallback_to_warp = True
+        # 3. 如果所有代理节点尝试均失败或未配置任何代理，执行 WARP 保底
+        if not success:
+            log("代理节点全部失败或未配置，进入 WARP 兜底模式...")
+            for attempt in range(1, 6):
+                current_route = "全局 WARP"
+                log(f"--- 账号 {acc_id} | {current_route} 兜底 | 续期尝试 {attempt}/5 ---")
+                
                 restart_warp()
                 
-            finally:
-                if page:
-                    screen_name = f"account-{acc_id}-{'success' if success else 'fail'}.png"
-                    screenshot_path = capture_page_screenshot(page, os.path.join(screenshot_dir, screen_name))
-                    try: page.quit()
-                    except: pass
+                s, s_name, o_exp, n_exp, screen, reason = execute_browser_task(acc_id, url, False, current_route)
+                success, server_name, old_expire, new_expire = s, s_name, o_exp, n_exp
+                screenshot_path, failure_reason, final_route_type = screen, reason, current_route
+                
+                if success:
+                    break
+
     finally:
-        stop_singbox(singbox_proc)
         vdisplay.stop()
 
     return success, server_name, old_expire, new_expire, screenshot_path, failure_reason, final_route_type
+
 
 def main():
     secrets_json_str = os.getenv("ALL_SECRETS", "{}")
@@ -421,7 +476,6 @@ def main():
         injected_secrets = {}
         
     env_vars = {**os.environ, **injected_secrets}
-    
     tg_tc = env_vars.get("TG_TC", "").strip()
 
     raw_accounts = {}
@@ -431,13 +485,18 @@ def main():
         
         if key.startswith("RENEW_URLS_"):
             suffix = key.replace("RENEW_URLS_", "")
-            if suffix not in raw_accounts: raw_accounts[suffix] = {"id": suffix, "url": "", "proxy": ""}
+            if suffix not in raw_accounts: raw_accounts[suffix] = {"id": suffix, "url": "", "proxy": "", "proxy_link": ""}
             raw_accounts[suffix]["url"] = val_str
             
         elif key.startswith("PROXY_URL_"):
             suffix = key.replace("PROXY_URL_", "")
-            if suffix not in raw_accounts: raw_accounts[suffix] = {"id": suffix, "url": "", "proxy": ""}
+            if suffix not in raw_accounts: raw_accounts[suffix] = {"id": suffix, "url": "", "proxy": "", "proxy_link": ""}
             raw_accounts[suffix]["proxy"] = val_str
+
+        elif key.startswith("PROXY_LINK_"):
+            suffix = key.replace("PROXY_LINK_", "")
+            if suffix not in raw_accounts: raw_accounts[suffix] = {"id": suffix, "url": "", "proxy": "", "proxy_link": ""}
+            raw_accounts[suffix]["proxy_link"] = val_str
 
     accounts = [acc for acc in raw_accounts.values() if acc["url"]]
     
@@ -452,7 +511,8 @@ def main():
 
     total_success = 0
     for acc in accounts:
-        log(f"\n{'='*60}\n开始处理账号 {acc['id']} (代理: {'已配置' if acc['proxy'] else '未配置'})\n{'='*60}")
+        has_proxy = bool(acc['proxy'] or acc.get('proxy_link'))
+        log(f"\n{'='*60}\n开始处理账号 {acc['id']} (代理: {'已配置' if has_proxy else '未配置'})\n{'='*60}")
         
         success, server_name, old_expire, new_expire, screenshot, fail_reason, route_type = process_account(acc)
 
