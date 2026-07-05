@@ -14,6 +14,7 @@ jobs:
   run-renew:
     name: 执行自动化续期脚本
     runs-on: ubuntu-latest
+    timeout-minutes: 150
 
     steps:
       - name: 拉取仓库代码
