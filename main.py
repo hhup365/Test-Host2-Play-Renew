@@ -21,6 +21,7 @@ except ImportError:
 
 MAX_CAPTCHA = 3
 LOCAL_PROXY = "http://127.0.0.1:8080"
+SUCCESS_THRESHOLD_SECONDS = 7 * 3600  # 7小时的秒数
 
 class CaptchaBlocked(Exception):
     pass
@@ -54,7 +55,6 @@ def send_tg_photo(tg_tc, photo_path, caption, parse_mode='HTML'):
         log(f"Telegram 图片通知异常: {e}", "ERROR")
 
 def build_notification(success, account_id, url, server_name, old_expire, new_expire=None, route_type="未知", failure_reason=""):
-    """构建精美的 HTML 格式 TG 通知"""
     server_name_safe = html.escape(server_name)
     url_safe = html.escape(url)
     
@@ -100,23 +100,46 @@ def fetch_subscription(url):
         log(f"获取或解析订阅链接失败: {e}", "ERROR")
         return []
 
-def get_server_name(page):
-    try:
-        if ele := page.ele('#serverName', timeout=2): return ele.text.strip()
-    except: pass
-    return "未知"
+def mask_ip(ip_str):
+    if not ip_str: return "Unknown"
+    # IPv4 处理
+    if '.' in ip_str:
+        parts = ip_str.split('.')
+        if len(parts) == 4:
+            return f"{parts[0]}.*.*.{parts[3]}"
+    # IPv6 处理
+    elif ':' in ip_str:
+        parts = ip_str.split(':')
+        if len(parts) >= 3:
+            return f"{parts[0]}:*:*:{parts[-1]}"
+    return ip_str
 
-def get_expire_time(page):
+def check_proxy_ip(use_custom_proxy=True):
+    """检测当前网络连通性并返回脱敏IP"""
+    proxies = {"http": LOCAL_PROXY, "https": LOCAL_PROXY} if use_custom_proxy else None
     try:
-        if ele := page.ele('#expireDate', timeout=2): return ele.text.strip()
-    except: pass
-    for selector in ['text:Expires in:', 'text:Deletes on:']:
-        try:
-            if ele := page.ele(selector, timeout=1):
-                text = (ele.text or "").strip()
-                return text.split(":", 1)[1].strip() if ":" in text else text
-        except: pass
-    return "未知"
+        # ip-api.com 是快速且免费的 IP 查询接口
+        r = requests.get("http://ip-api.com/json?fields=query", proxies=proxies, timeout=8)
+        r.raise_for_status()
+        ip = r.json().get("query", "")
+        if ip:
+            return True, mask_ip(ip)
+    except Exception as e:
+        return False, str(e)
+    return False, "无法获取IP响应"
+
+def parse_time_and_check(time_str):
+    """判断给定的倒计时文本(HH:mm:ss)是否大于7小时"""
+    if not time_str or "expired" in time_str.lower(): return False, 0
+    try:
+        parts = time_str.strip().split(':')
+        if len(parts) == 3:
+            h, m, s = map(int, parts)
+            total_sec = h * 3600 + m * 60 + s
+            return total_sec > SUCCESS_THRESHOLD_SECONDS, total_sec
+    except:
+        pass
+    return False, 0
 
 def capture_page_screenshot(page, file_name):
     try:
@@ -134,7 +157,6 @@ def start_singbox(proxy_url):
         proc = subprocess.Popen(["sing-box", "run", "-c", "config.json"], 
                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(3) 
-        log("自定义代理启动成功 (127.0.0.1:8080)")
         return proc
     except Exception as e:
         log(f"启动自定义代理失败: {e}", "ERROR")
@@ -142,7 +164,6 @@ def start_singbox(proxy_url):
 
 def stop_singbox(proc):
     if proc:
-        log("关闭自定义代理 (sing-box)...")
         try:
             os.kill(proc.pid, signal.SIGTERM)
             proc.wait(timeout=3)
@@ -151,7 +172,7 @@ def stop_singbox(proc):
             except: pass
 
 def restart_warp():
-    log("正在重启 WARP 以更换 IP...")
+    log("正在重启 WARP 以强制更换 IP...")
     try:
         subprocess.run(["sudo", "warp-cli", "--accept-tos", "disconnect"], check=False, timeout=15, capture_output=True)
         time.sleep(2)
@@ -344,39 +365,63 @@ def execute_browser_task(acc_id, url, using_custom_proxy, current_route):
         """)
 
         page.get(url, retry=3)
-        time.sleep(random.uniform(5, 8))
-
-        server_name = get_server_name(page)
-        old_expire = get_expire_time(page)
-        log(f"节点: {server_name}, 当前到期: {old_expire}, 当前路由: {current_route}")
-
-        page.run_js("document.querySelectorAll('ins.adsbygoogle, .modal-backdrop').forEach(e => e.remove());")
-        if consent := page.ele('tag:button@@text():Consent', timeout=2): consent.click()
-        time.sleep(2)
-
-        if renew_btn1 := page.ele('xpath://button[contains(text(), "Renew server")]', timeout=3): renew_btn1.click(by_js=True)
         time.sleep(3)
+        
+        try: page.wait.ele_hidden('#loader', timeout=15)
+        except: pass
+        
+        if name_ele := page.ele('#serverName', timeout=3):
+            server_name = name_ele.text.strip()
+            
+        # 初始时间检查
+        if exp_ele := page.ele('#expireDate', timeout=5):
+            old_expire = exp_ele.text.strip()
+            is_success, _ = parse_time_and_check(old_expire)
+            if is_success:
+                log(f"当前节点[{server_name}]剩余时间已大于7小时，无需续订跳过。")
+                return True, server_name, old_expire, old_expire, None, ""
+        
+        log(f"节点: {server_name}, 当前到期: {old_expire}")
 
-        page.ele('text:Expires in:', timeout=8)
-        if renew_btn2 := page.ele('xpath://button[contains(text(), "Renew server")]', timeout=2): renew_btn2.click(by_js=True)
-        time.sleep(8)
+        # 清理可能遮挡的元素
+        page.run_js("document.querySelectorAll('ins.adsbygoogle, .modal-backdrop').forEach(e => e.remove());")
+        
+        # 点击续期按钮唤出验证码 (SweetAlert)
+        renew_btn = page.ele('xpath://button[contains(text(), "Renew server")]', timeout=3)
+        if not renew_btn:
+            raise Exception("未能在页面上找到 Renew server 按钮")
+        renew_btn.click(by_js=True)
 
+        # 等待 SweetAlert 弹窗加载
+        page.wait.ele_displayed('.swal2-popup', timeout=8)
+        
         if find_recaptcha_frame(page, "anchor"):
             log("启动 reCAPTCHA 破解...")
             solve_recaptcha(page, using_custom_proxy) # 如被封禁将抛出 CaptchaBlocked
         
-        if final_btn := page.ele('xpath://button[normalize-space(text())="Renew"]', timeout=3):
-            final_btn.click(by_js=True)
-            time.sleep(10)
-            new_expire = get_expire_time(page)
-            if new_expire != old_expire and new_expire != "未知": 
-                success = True
-            elif "successfully" in (page.html or "").lower(): 
-                success = True
-            else: 
-                failure_reason = "未能检测到成功标志"
+        # 点击 SweetAlert 的 Confirm 按钮完成提交流程
+        confirm_btn = page.ele('.swal2-confirm', timeout=3)
+        if confirm_btn:
+            confirm_btn.click(by_js=True)
         else:
-            failure_reason = "未找到最终 Renew 按钮"
+            raise Exception("验证完毕后未找到 SweetAlert 的确认按钮")
+
+        log("表单已提交，正在监听面板重载以核实验证结果(目标 > 7小时)...")
+        for _ in range(15):
+            time.sleep(2)
+            try:
+                cur_text = page.ele('#expireDate', timeout=1).text.strip()
+                if cur_text:
+                    new_expire = cur_text
+                    is_valid, _ = parse_time_and_check(cur_text)
+                    if is_valid:
+                        success = True
+                        break
+            except:
+                pass # 页面正在 reload 过程中元素可能获取不到
+                
+        if not success:
+            failure_reason = "续订提交后，验证面板刷新时间并未大于7小时（可能失败或被限制）"
 
     except CaptchaBlocked:
         log("IP 被封锁！", "WARN")
@@ -407,32 +452,46 @@ def process_account(account):
     vdisplay.start()
     
     try:
+        # 1. 代理池策略 (标识来源以控制不同重试次数)
         proxies_to_try = []
         if proxy_url:
-            proxies_to_try.append(proxy_url)
+            proxies_to_try.append({"url": proxy_url, "type": "SINGLE"})
+            
         if proxy_link:
             log(f"账号 {acc_id} 配置了订阅链接，正在获取解析...")
             subs = fetch_subscription(proxy_link)
             if subs:
                 log(f"解析到 {len(subs)} 个有效代理节点。")
-                proxies_to_try.extend(subs)
+                for sub in subs:
+                    proxies_to_try.append({"url": sub, "type": "SUB"})
             else:
                 log("未解析出任何代理节点或订阅链接无效", "WARN")
 
         # 2. 按顺序执行每个自定义代理节点
-        for p_idx, p in enumerate(proxies_to_try):
+        for p_idx, p_data in enumerate(proxies_to_try):
             if success: break
             
-            # 单代理尝试固定为 3 次
-            for attempt in range(1, 4):
-                current_route = f"代理节点 {p_idx+1} (Sing-box)"
-                log(f"--- 账号 {acc_id} | {current_route} | 续期尝试 {attempt}/3 ---")
+            p_node = p_data["url"]
+            # SINGLE (PROXY_URL_1) 尝试 2 次，SUB (PROXY_LINK_1) 只尝试 1 次
+            max_attempts = 2 if p_data["type"] == "SINGLE" else 1
+            
+            for attempt in range(1, max_attempts + 1):
+                current_route = f"代理节点 {p_idx+1} ({'主配置' if p_data['type']=='SINGLE' else '订阅解析'})"
+                log(f"--- 账号 {acc_id} | {current_route} | 续期尝试 {attempt}/{max_attempts} ---")
                 
-                singbox_proc = start_singbox(p)
+                singbox_proc = start_singbox(p_node)
                 if not singbox_proc:
-                    log("自定义代理启动失败，跳过此次重试")
-                    continue
+                    log("自定义代理启动失败，跳过该节点")
+                    break
                     
+                is_connected, ip_info = check_proxy_ip(use_custom_proxy=True)
+                if not is_connected:
+                    log(f"当前节点网络异常/连接超时，跳过该次重试。({ip_info})", "WARN")
+                    stop_singbox(singbox_proc)
+                    break # 进入下一个节点循环
+
+                log(f"当前代理连通性正常，生效公网 IP: {ip_info}")
+
                 s, s_name, o_exp, n_exp, screen, reason = execute_browser_task(acc_id, url, True, current_route)
                 stop_singbox(singbox_proc)
                 
@@ -443,17 +502,23 @@ def process_account(account):
                     break
                     
                 if "IP被封锁" in failure_reason:
-                    log("当前代理IP已被验证码封锁，终止当前代理其余尝试，更换下一个节点", "WARN")
-                    break  # IP已被封禁，尝试下个节点
+                    log("当前代理IP已被验证码彻底封锁，停止该节点其余尝试", "WARN")
+                    break  # 直接跳出内层重试，换下一个节点
 
-        # 3. 如果所有代理节点尝试均失败或未配置任何代理，执行 WARP 保底
+        # 3. 如果所有代理节点尝试均失败，执行 WARP 保底 (最多5次)
         if not success:
-            log("代理节点全部失败或未配置，进入 WARP 兜底模式...")
+            log("所有代理策略均失败/无配置，进入 WARP 兜底模式...")
             for attempt in range(1, 6):
                 current_route = "全局 WARP"
                 log(f"--- 账号 {acc_id} | {current_route} 兜底 | 续期尝试 {attempt}/5 ---")
                 
                 restart_warp()
+                
+                is_connected, ip_info = check_proxy_ip(use_custom_proxy=False)
+                if not is_connected:
+                    log("WARP 网络连接异常，进行下一次尝试重置...", "WARN")
+                    continue
+                log(f"WARP 连通性正常，公网 IP: {ip_info}")
                 
                 s, s_name, o_exp, n_exp, screen, reason = execute_browser_task(acc_id, url, False, current_route)
                 success, server_name, old_expire, new_expire = s, s_name, o_exp, n_exp
@@ -461,6 +526,9 @@ def process_account(account):
                 
                 if success:
                     break
+                
+                if "IP被封锁" in failure_reason:
+                    log("WARP 当前IP被封锁，即将刷新IP", "WARN")
 
     finally:
         vdisplay.stop()
